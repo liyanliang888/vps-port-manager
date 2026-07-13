@@ -371,7 +371,7 @@ detect_ssh_config_path() {
 # 修改 SSH 端口
 change_ssh_port() {
     local new_port=$1
-    local current_port=$(get_ssh_port)
+    local current_port=${2:-$(get_ssh_port)}
     local config_file=$(detect_ssh_config_path)
 
     echo -e "${BLUE}[信息] 当前 SSH 端口: ${current_port}${NC}"
@@ -413,8 +413,8 @@ change_ssh_port() {
     open_port "$new_port" "tcp"
     open_port "$new_port" "udp"
 
-    # 如果需要，确保旧端口仍然开放（用户可手动关闭）
-    echo -e "${YELLOW}[提示] 旧端口 ${current_port} 保持开放，确认新端口可连接后可手动关闭。${NC}"
+    # 旧端口暂时保持开放，等新端口验证通过后再关闭
+    echo -e "${YELLOW}[提示] 旧端口 ${current_port} 暂时保持开放，新端口验证通过后自动关闭。${NC}"
 
     # 验证配置
     echo -e "${BLUE}[信息] 验证 SSH 配置...${NC}"
@@ -522,22 +522,34 @@ change_ssh_port() {
 
     # 验证新端口是否在监听
     sleep 2
+    local port_listening=false
     if command -v ss &>/dev/null; then
         local listening=$(ss -tlnp 2>/dev/null | grep ":${new_port}" | head -1)
         if [[ -n "$listening" ]]; then
             echo -e "${GREEN}[成功] 新 SSH 端口 ${new_port} 已在监听${NC}"
+            port_listening=true
         else
-            echo -e "${YELLOW}[警告] 未检测到端口 ${new_port} 在监听，请检查 SSH 日志${NC}"
-            echo -e "  journalctl -u sshd -n 20"
+            echo -e "${RED}[错误] 未检测到端口 ${new_port} 在监听！${NC}"
+            echo -e "${YELLOW}旧端口 ${current_port} 保持开放，不会关闭。${NC}"
+            echo -e "${YELLOW}请检查 SSH 日志: journalctl -u sshd -n 20${NC}"
+            return 1
         fi
     fi
 
-    echo -e "${GREEN}[成功] SSH 端口已修改为 ${new_port}${NC}"
+    # 新端口验证通过，自动关闭旧端口
+    if [[ "$port_listening" == "true" && "$current_port" != "$new_port" ]]; then
+        echo -e "${YELLOW}[提示] 正在关闭旧端口 ${current_port}...${NC}"
+        close_port "$current_port" "tcp"
+        close_port "$current_port" "udp"
+        echo -e "${GREEN}[成功] 旧端口 ${current_port} 已关闭${NC}"
+    fi
+
+    echo -e "${GREEN}[成功] SSH 端口已修改为 ${new_port}，旧端口已关闭${NC}"
     echo -e "${YELLOW}========================================${NC}"
     echo -e "${YELLOW}⚠️  重要提醒:${NC}"
-    echo -e "${YELLOW}1. 不要关闭当前连接，先新开终端测试新端口连接${NC}"
+    echo -e "${YELLOW}1. 当前连接不会立即断开，但重连需使用新端口${NC}"
     echo -e "${YELLOW}2. 连接命令: ssh -p ${new_port} 用户名@服务器IP${NC}"
-    echo -e "${YELLOW}3. 确认新端口可连接后，再关闭旧端口${NC}"
+    echo -e "${YELLOW}3. 如需还原，编辑 /etc/ssh/sshd_config 恢复 Port ${current_port}${NC}"
     echo -e "${YELLOW}========================================${NC}"
 }
 
@@ -778,13 +790,13 @@ menu_change_ssh_port() {
     echo -e "${RED}⚠️  警告:${NC}"
     echo -e "  - 修改后需要使用新端口重新连接"
     echo -e "  - 新端口将自动在防火墙开放"
-    echo -e "  - 旧端口保持开放（确认后可手动关闭）"
-    echo -e "  - 建议保持当前连接不断开"
+    echo -e "  - 新端口验证通过后，旧端口 ${current_port} 将自动关闭"
+    echo -e "  - 请确保新端口能正常连接后再断开当前连接"
     echo ""
 
     read -p "确认修改？(y/N): " confirm
     if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
-        change_ssh_port "$new_port"
+        change_ssh_port "$new_port" "$current_port"
     else
         echo -e "${YELLOW}[提示] 已取消${NC}"
     fi
