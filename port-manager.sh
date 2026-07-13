@@ -452,6 +452,20 @@ change_ssh_port() {
             if [[ -f /etc/ssh/sshd_config ]]; then
                 sed -i -E "s/^#(Port .*)/\1/" /etc/ssh/sshd_config 2>/dev/null || true
             fi
+            # 还原 socket 文件（如果有备份）
+            for sock_bak in "$BACKUP_DIR"/ssh.socket_* "$BACKUP_DIR"/sshd.socket_*; do
+                if [[ -f "$sock_bak" ]]; then
+                    local sock_name=$(basename "$sock_bak" | sed -E "s/_[0-9]+\.bak//")
+                    for f in "/lib/systemd/system/$sock_name" "/etc/systemd/system/$sock_name"; do
+                        if [[ -f "$f" ]]; then
+                            cp "$sock_bak" "$f"
+                            systemctl daemon-reload 2>/dev/null || true
+                            echo -e "${YELLOW}[提示] 已还原 $sock_name${NC}"
+                            break
+                        fi
+                    done
+                fi
+            done
             echo -e "${YELLOW}[提示] 已回滚配置。${NC}"
             return 1
         fi
@@ -467,54 +481,127 @@ change_ssh_port() {
     local restart_output=""
     local restart_rc=1
 
-    # 关闭 set -e 的影响，显式处理错误
-    case "$INIT_SYSTEM" in
-        systemd)
-            # 尝试多种服务名
-            for svc in "$SSH_SERVICE" sshd ssh; do
-                restart_output=$(systemctl restart "$svc" 2>&1)
-                restart_rc=$?
-                if [[ $restart_rc -eq 0 ]]; then
-                    echo -e "${GREEN}[成功] 已通过 systemctl restart $svc 重启 SSH${NC}"
-                    break
-                fi
-            done
-            ;;
-        openrc)
-            for svc in sshd ssh; do
-                restart_output=$(rc-service "$svc" restart 2>&1)
-                restart_rc=$?
-                if [[ $restart_rc -eq 0 ]]; then
-                    echo -e "${GREEN}[成功] 已通过 rc-service $svc restart 重启 SSH${NC}"
-                    break
-                fi
-            done
-            ;;
-        *)
-            for svc in sshd ssh; do
-                restart_output=$(service "$svc" restart 2>&1)
-                restart_rc=$?
-                if [[ $restart_rc -eq 0 ]]; then
-                    echo -e "${GREEN}[成功] 已通过 service $svc restart 重启 SSH${NC}"
-                    break
-                fi
-            done
-            if [[ $restart_rc -ne 0 ]]; then
-                restart_output=$(/etc/init.d/sshd restart 2>&1)
-                restart_rc=$?
+    # 检测并处理 systemd socket activation
+    local socket_active=""
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        for sock in ssh.socket sshd.socket; do
+            if systemctl is-active "$sock" &>/dev/null 2>&1; then
+                socket_active="$sock"
+                break
             fi
-            ;;
-    esac
+        done
+    fi
 
-    if [[ $restart_rc -eq 0 ]]; then
-        echo -e "${GREEN}[成功] SSH 服务已重启${NC}"
+    if [[ -n "$socket_active" ]]; then
+        echo -e "${YELLOW}[提示] 检测到 systemd socket activation ($socket_active)${NC}"
+        echo -e "${YELLOW}[提示] 需要修改 socket 监听端口，否则端口修改不生效${NC}"
+
+        # 备份 socket 文件
+        local socket_file=""
+        for f in "/lib/systemd/system/$socket_active" "/etc/systemd/system/$socket_active"; do
+            if [[ -f "$f" ]]; then
+                socket_file="$f"
+                break
+            fi
+        done
+
+        if [[ -n "$socket_file" ]]; then
+            cp "$socket_file" "$BACKUP_DIR/${socket_active}_${TIMESTAMP}.bak" 2>/dev/null || true
+            echo -e "${GREEN}[成功] 已备份 $socket_file${NC}"
+
+            # 备份并修改 socket 文件中的 ListenStream
+            if grep -q "ListenStream" "$socket_file" 2>/dev/null; then
+                # 停止 socket 和 service
+                systemctl stop "$socket_active" 2>/dev/null || true
+                systemctl stop "$SSH_SERVICE" 2>/dev/null || true
+                systemctl stop sshd 2>/dev/null || true
+                systemctl stop ssh 2>/dev/null || true
+
+                # 杀掉残留 sshd 进程
+                killall sshd 2>/dev/null || true
+
+                # 替换 ListenStream 端口
+                sed -i -E "s/^ListenStream=[0-9]+/ListenStream=${new_port}/" "$socket_file"
+                echo -e "${GREEN}[成功] 已修改 $socket_file: ListenStream=${new_port}${NC}"
+
+                # 重新加载 systemd 并启动
+                systemctl daemon-reload
+                systemctl start "$socket_active" 2>/dev/null || true
+                restart_output=$(systemctl restart "$SSH_SERVICE" 2>&1)
+                restart_rc=$?
+
+                if [[ $restart_rc -ne 0 ]]; then
+                    # 尝试其他服务名
+                    for svc in sshd ssh; do
+                        restart_output=$(systemctl restart "$svc" 2>&1)
+                        restart_rc=$?
+                        [[ $restart_rc -eq 0 ]] && break
+                    done
+                fi
+
+                if [[ $restart_rc -eq 0 ]]; then
+                    echo -e "${GREEN}[成功] SSH 服务已重启（含 socket 端口更新）${NC}"
+                else
+                    echo -e "${RED}[错误] SSH 服务重启失败！${NC}"
+                    echo -e "${RED}详情: ${restart_output}${NC}"
+                    echo -e "${YELLOW}[提示] 请手动检查: systemctl status $socket_active${NC}"
+                    return 1
+                fi
+            else
+                echo -e "${YELLOW}[提示] socket 文件中未找到 ListenStream，跳过修改${NC}"
+            fi
+        else
+            echo -e "${YELLOW}[警告] 找不到 $socket_active 文件，跳过 socket 修改${NC}"
+        fi
     else
-        echo -e "${RED}[错误] SSH 服务重启失败！${NC}"
-        echo -e "${RED}详情: ${restart_output}${NC}"
-        echo -e "${YELLOW}[提示] 配置已修改但服务未重启，请手动检查:${NC}"
-        echo -e "  systemctl status sshd"
-        echo -e "  journalctl -u sshd -n 20"
-        return 1
+        # 没有 socket activation，正常重启
+        case "$INIT_SYSTEM" in
+            systemd)
+                for svc in "$SSH_SERVICE" sshd ssh; do
+                    restart_output=$(systemctl restart "$svc" 2>&1)
+                    restart_rc=$?
+                    if [[ $restart_rc -eq 0 ]]; then
+                        echo -e "${GREEN}[成功] 已通过 systemctl restart $svc 重启 SSH${NC}"
+                        break
+                    fi
+                done
+                ;;
+            openrc)
+                for svc in sshd ssh; do
+                    restart_output=$(rc-service "$svc" restart 2>&1)
+                    restart_rc=$?
+                    if [[ $restart_rc -eq 0 ]]; then
+                        echo -e "${GREEN}[成功] 已通过 rc-service $svc restart 重启 SSH${NC}"
+                        break
+                    fi
+                done
+                ;;
+            *)
+                for svc in sshd ssh; do
+                    restart_output=$(service "$svc" restart 2>&1)
+                    restart_rc=$?
+                    if [[ $restart_rc -eq 0 ]]; then
+                        echo -e "${GREEN}[成功] 已通过 service $svc restart 重启 SSH${NC}"
+                        break
+                    fi
+                done
+                if [[ $restart_rc -ne 0 ]]; then
+                    restart_output=$(/etc/init.d/sshd restart 2>&1)
+                    restart_rc=$?
+                fi
+                ;;
+        esac
+
+        if [[ $restart_rc -eq 0 ]]; then
+            echo -e "${GREEN}[成功] SSH 服务已重启${NC}"
+        else
+            echo -e "${RED}[错误] SSH 服务重启失败！${NC}"
+            echo -e "${RED}详情: ${restart_output}${NC}"
+            echo -e "${YELLOW}[提示] 配置已修改但服务未重启，请手动检查:${NC}"
+            echo -e "  systemctl status sshd"
+            echo -e "  journalctl -u sshd -n 20"
+            return 1
+        fi
     fi
 
     # 检查 SELinux 是否可能阻止（CentOS/RHEL）
