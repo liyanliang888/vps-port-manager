@@ -5,7 +5,7 @@
 #  功能: 交互式管理入站端口、修改SSH端口、快捷启动
 # ============================================================
 
-set -e
+set +e
 
 # ==================== 全局变量 ====================
 SCRIPT_PATH="$(readlink -f "$0")"
@@ -111,13 +111,32 @@ detect_init_system() {
 
 # 检测 SSH 服务名
 detect_ssh_service() {
-    if systemctl list-unit-files 2>/dev/null | grep -q "ssh.service"; then
+    # 优先检查实际运行中的 ssh 服务
+    if systemctl is-active ssh &>/dev/null 2>&1; then
         SSH_SERVICE="ssh"
-    elif systemctl list-unit-files 2>/dev/null | grep -q "sshd.service"; then
+    elif systemctl is-active sshd &>/dev/null 2>&1; then
         SSH_SERVICE="sshd"
-    elif command -v sshd &>/dev/null; then
+    elif systemctl is-active ssh.service &>/dev/null 2>&1; then
+        SSH_SERVICE="ssh"
+    elif systemctl is-active sshd.service &>/dev/null 2>&1; then
+        SSH_SERVICE="sshd"
+    # 检查已安装的服务文件
+    elif systemctl list-unit-files 2>/dev/null | grep -qE "^ssh\.service"; then
+        SSH_SERVICE="ssh"
+    elif systemctl list-unit-files 2>/dev/null | grep -qE "^sshd\.service"; then
+        SSH_SERVICE="sshd"
+    elif [[ -f /lib/systemd/system/ssh.service ]] || [[ -f /etc/systemd/system/ssh.service ]]; then
+        SSH_SERVICE="ssh"
+    elif [[ -f /lib/systemd/system/sshd.service ]] || [[ -f /etc/systemd/system/sshd.service ]]; then
         SSH_SERVICE="sshd"
     else
+        # 兜底：尝试所有可能的名字
+        for svc in ssh sshd; do
+            if systemctl status "$svc" &>/dev/null 2>&1; then
+                SSH_SERVICE="$svc"
+                return
+            fi
+        done
         SSH_SERVICE="ssh"
     fi
 }
@@ -431,30 +450,44 @@ change_ssh_port() {
     detect_ssh_service
     detect_init_system
 
-    local restart_output
+    local restart_output=""
     local restart_rc=1
 
+    # 关闭 set -e 的影响，显式处理错误
     case "$INIT_SYSTEM" in
         systemd)
             # 尝试多种服务名
             for svc in "$SSH_SERVICE" sshd ssh; do
-                restart_output=$(systemctl restart "$svc" 2>&1) && restart_rc=0 && break
+                restart_output=$(systemctl restart "$svc" 2>&1)
                 restart_rc=$?
+                if [[ $restart_rc -eq 0 ]]; then
+                    echo -e "${GREEN}[成功] 已通过 systemctl restart $svc 重启 SSH${NC}"
+                    break
+                fi
             done
             ;;
         openrc)
             for svc in sshd ssh; do
-                restart_output=$(rc-service "$svc" restart 2>&1) && restart_rc=0 && break
+                restart_output=$(rc-service "$svc" restart 2>&1)
                 restart_rc=$?
+                if [[ $restart_rc -eq 0 ]]; then
+                    echo -e "${GREEN}[成功] 已通过 rc-service $svc restart 重启 SSH${NC}"
+                    break
+                fi
             done
             ;;
         *)
             for svc in sshd ssh; do
-                restart_output=$(service "$svc" restart 2>&1) && restart_rc=0 && break
+                restart_output=$(service "$svc" restart 2>&1)
                 restart_rc=$?
+                if [[ $restart_rc -eq 0 ]]; then
+                    echo -e "${GREEN}[成功] 已通过 service $svc restart 重启 SSH${NC}"
+                    break
+                fi
             done
             if [[ $restart_rc -ne 0 ]]; then
-                restart_output=$(/etc/init.d/sshd restart 2>&1) && restart_rc=0 || restart_rc=$?
+                restart_output=$(/etc/init.d/sshd restart 2>&1)
+                restart_rc=$?
             fi
             ;;
     esac
@@ -578,10 +611,11 @@ show_main_menu() {
     echo -e "${GREEN} 7)${NC} 一键放行常用端口"
     echo -e "${GREEN} 8)${NC} 重置防火墙"
     echo -e "${GREEN} 9)${NC} 安装/卸载快捷命令"
+    echo -e "${RED}10)${NC} 卸载脚本"
     echo -e "${RED} 0)${NC} 退出"
     echo -e "${BOLD}============================${NC}"
     echo ""
-    read -p "请选择 [0-9]: " choice
+    read -p "请选择 [0-10]: " choice
 
     case $choice in
         1) show_firewall_status; press_enter ;;
@@ -593,6 +627,7 @@ show_main_menu() {
         7) menu_open_common_ports ;;
         8) menu_reset_firewall ;;
         9) menu_setup_shortcut ;;
+        10) menu_uninstall_script ;;
         0) echo -e "${GREEN}再见！${NC}"; exit 0 ;;
         *) echo -e "${RED}无效选择${NC}"; sleep 1; show_main_menu ;;
     esac
@@ -945,6 +980,66 @@ uninstall_shortcut() {
     rm -f /usr/local/bin/dk 2>/dev/null || true
 
     echo -e "${GREEN}[成功] 快捷命令已卸载${NC}"
+}
+
+# ==================== 脚本卸载 ====================
+
+menu_uninstall_script() {
+    echo -e "\n${BOLD}=== 卸载脚本 ===${NC}"
+    echo -e "${RED}⚠️  警告: 将删除以下内容:${NC}"
+    echo -e "  - 快捷命令 dk (/usr/local/bin/dk)"
+    echo -e "  - shell rc 文件中的 alias 条目"
+    echo -e "  - 脚本本体: ${SCRIPT_PATH}"
+    echo -e "  - 安装标记: /etc/port-manager-installed"
+    echo -e "  - 备份文件: ${BACKUP_DIR}/"
+    echo -e ""
+    echo -e "${YELLOW}注意: 防火墙规则和 SSH 配置不会被还原${NC}"
+    echo -e "${YELLOW}注意: 已安装的依赖包不会被卸载${NC}"
+    echo ""
+
+    read -p "确认卸载？(输入 yes 确认): " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        echo -e "${YELLOW}[提示] 已取消${NC}"
+        press_enter; return
+    fi
+
+    echo -e "${YELLOW}[提示] 正在卸载...${NC}"
+
+    # 1. 卸载快捷命令
+    for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.profile"; do
+        if [[ -f "$rc" ]]; then
+            sed -i '/# VPS Port Manager 快捷命令/d' "$rc" 2>/dev/null
+            sed -i "/alias pm='sudo bash ${SCRIPT_PATH}'/d" "$rc" 2>/dev/null
+            sed -i "/alias dk='sudo bash ${SCRIPT_PATH}'/d" "$rc" 2>/dev/null
+        fi
+    done
+    rm -f /usr/local/bin/pm 2>/dev/null || true
+    rm -f /usr/local/bin/dk 2>/dev/null || true
+    echo -e "  ${GREEN}●${NC} 快捷命令已删除"
+
+    # 2. 删除安装标记
+    rm -f /etc/port-manager-installed 2>/dev/null || true
+    echo -e "  ${GREEN}●${NC} 安装标记已删除"
+
+    # 3. 删除备份文件
+    rm -rf "$BACKUP_DIR" 2>/dev/null || true
+    echo -e "  ${GREEN}●${NC} 备份文件已删除"
+
+    # 4. 删除脚本本体
+    rm -f "$SCRIPT_PATH" 2>/dev/null || true
+    # 如果是从 git clone 的目录，删除整个目录
+    if [[ -d "$(dirname "$SCRIPT_PATH")/.git" ]]; then
+        rm -rf "$(dirname "$SCRIPT_PATH")" 2>/dev/null || true
+    fi
+    echo -e "  ${GREEN}●${NC} 脚本已删除"
+
+    echo ""
+    echo -e "${GREEN}[成功] 脚本已完全卸载！${NC}"
+    echo -e "${YELLOW}提示: 防火墙规则和 SSH 端口配置保持不变${NC}"
+    echo -e "${YELLOW}提示: 如需还原 SSH 端口，手动编辑 /etc/ssh/sshd_config${NC}"
+    echo ""
+    echo -e "${BOLD}再见！${NC}"
+    exit 0
 }
 
 # ==================== 首次安装 ====================
