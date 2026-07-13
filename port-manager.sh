@@ -326,6 +326,15 @@ get_ssh_port() {
 }
 
 detect_ssh_config_path() {
+    # 优先检查主配置文件
+    local main_config="/etc/ssh/sshd_config"
+
+    # 检查主配置文件是否有 Port 行（非注释）
+    if [[ -f "$main_config" ]] && grep -qE "^Port " "$main_config" 2>/dev/null; then
+        echo "$main_config"
+        return
+    fi
+
     # 检查 include 目录下的配置
     if [[ -d /etc/ssh/sshd_config.d ]]; then
         for f in /etc/ssh/sshd_config.d/*.conf; do
@@ -335,7 +344,9 @@ detect_ssh_config_path() {
             fi
         done
     fi
-    echo "/etc/ssh/sshd_config"
+
+    # 默认写入主配置文件
+    echo "$main_config"
 }
 
 # 修改 SSH 端口
@@ -353,13 +364,29 @@ change_ssh_port() {
     cp "$config_file" "$BACKUP_DIR/sshd_config_${TIMESTAMP}.bak"
     echo -e "${GREEN}[成功] 已备份原配置到 $BACKUP_DIR/sshd_config_${TIMESTAMP}.bak${NC}"
 
+    # 检查主配置文件中是否有 Include sshd_config.d 行
+    # 如果有，确保在 include 目录的文件中也设置端口
+    local main_has_include=false
+    if [[ -f /etc/ssh/sshd_config ]] && grep -qE "^Include /etc/ssh/sshd_config.d" /etc/ssh/sshd_config 2>/dev/null; then
+        main_has_include=true
+    fi
+
     # 检查配置文件中是否已有 Port 行
     if grep -qE "^#?Port " "$config_file"; then
-        # 替换现有的 Port 行
+        # 替换现有的 Port 行（包括被注释的）
         sed -i -E "s/^#?Port .*/Port ${new_port}/" "$config_file"
     else
         # 添加 Port 行
         echo "Port ${new_port}" >> "$config_file"
+    fi
+
+    # 如果主配置有 Include 但修改的是主文件，也尝试在 include 目录写入
+    if [[ "$main_has_include" == "true" ]] && [[ "$config_file" == "/etc/ssh/sshd_config" ]]; then
+        mkdir -p /etc/ssh/sshd_config.d 2>/dev/null
+        local override_file="/etc/ssh/sshd_config.d/99-port.conf"
+        echo "Port ${new_port}" > "$override_file"
+        chmod 644 "$override_file"
+        echo -e "${BLUE}[信息] 已写入 ${override_file}（Include 覆盖）${NC}"
     fi
 
     # 在防火墙中开放新端口
@@ -372,15 +399,31 @@ change_ssh_port() {
 
     # 验证配置
     echo -e "${BLUE}[信息] 验证 SSH 配置...${NC}"
+    local sshd_cmd=""
     if command -v sshd &>/dev/null; then
-        if sshd -t 2>/dev/null; then
+        sshd_cmd="sshd"
+    elif [[ -f /usr/sbin/sshd ]]; then
+        sshd_cmd="/usr/sbin/sshd"
+    fi
+
+    if [[ -n "$sshd_cmd" ]]; then
+        local validate_output
+        validate_output=$($sshd_cmd -t 2>&1)
+        local validate_rc=$?
+        if [[ $validate_rc -eq 0 ]]; then
             echo -e "${GREEN}[成功] SSH 配置验证通过${NC}"
         else
-            echo -e "${RED}[错误] SSH 配置验证失败！正在回滚...${NC}"
+            echo -e "${RED}[错误] SSH 配置验证失败！${NC}"
+            echo -e "${RED}详情: ${validate_output}${NC}"
+            echo -e "${YELLOW}[提示] 正在回滚配置...${NC}"
             cp "$BACKUP_DIR/sshd_config_${TIMESTAMP}.bak" "$config_file"
+            # 清理可能创建的 override 文件
+            rm -f /etc/ssh/sshd_config.d/99-port.conf 2>/dev/null || true
             echo -e "${YELLOW}[提示] 已回滚配置。${NC}"
             return 1
         fi
+    else
+        echo -e "${YELLOW}[警告] 未找到 sshd，跳过配置验证${NC}"
     fi
 
     # 重启 SSH 服务
@@ -388,17 +431,73 @@ change_ssh_port() {
     detect_ssh_service
     detect_init_system
 
+    local restart_output
+    local restart_rc=1
+
     case "$INIT_SYSTEM" in
         systemd)
-            systemctl restart "$SSH_SERVICE" 2>/dev/null || systemctl restart sshd 2>/dev/null
+            # 尝试多种服务名
+            for svc in "$SSH_SERVICE" sshd ssh; do
+                restart_output=$(systemctl restart "$svc" 2>&1) && restart_rc=0 && break
+                restart_rc=$?
+            done
             ;;
         openrc)
-            rc-service sshd restart 2>/dev/null || rc-service ssh restart 2>/dev/null
+            for svc in sshd ssh; do
+                restart_output=$(rc-service "$svc" restart 2>&1) && restart_rc=0 && break
+                restart_rc=$?
+            done
             ;;
         *)
-            service sshd restart 2>/dev/null || service ssh restart 2>/dev/null || /etc/init.d/sshd restart 2>/dev/null
+            for svc in sshd ssh; do
+                restart_output=$(service "$svc" restart 2>&1) && restart_rc=0 && break
+                restart_rc=$?
+            done
+            if [[ $restart_rc -ne 0 ]]; then
+                restart_output=$(/etc/init.d/sshd restart 2>&1) && restart_rc=0 || restart_rc=$?
+            fi
             ;;
     esac
+
+    if [[ $restart_rc -eq 0 ]]; then
+        echo -e "${GREEN}[成功] SSH 服务已重启${NC}"
+    else
+        echo -e "${RED}[错误] SSH 服务重启失败！${NC}"
+        echo -e "${RED}详情: ${restart_output}${NC}"
+        echo -e "${YELLOW}[提示] 配置已修改但服务未重启，请手动检查:${NC}"
+        echo -e "  systemctl status sshd"
+        echo -e "  journalctl -u sshd -n 20"
+        return 1
+    fi
+
+    # 检查 SELinux 是否可能阻止（CentOS/RHEL）
+    if command -v getenforce &>/dev/null; then
+        local selinux_state=$(getenforce 2>/dev/null)
+        if [[ "$selinux_state" == "Enforcing" ]]; then
+            echo -e "${YELLOW}[提示] 检测到 SELinux 处于 Enforcing 状态${NC}"
+            echo -e "${YELLOW}  需要为新端口添加 SELinux 策略:${NC}"
+            echo -e "  ${CYAN}semanage port -a -t ssh_port_t -p tcp ${new_port}${NC}"
+            echo -e "${YELLOW}  如果 semanage 不可用，安装 policycoreutils-python-utils${NC}"
+            # 尝试自动添加
+            if command -v semanage &>/dev/null; then
+                semanage port -a -t ssh_port_t -p tcp ${new_port} 2>/dev/null || \
+                    semanage port -m -t ssh_port_t -p tcp ${new_port} 2>/dev/null || true
+                echo -e "${GREEN}[成功] 已添加 SELinux 端口策略${NC}"
+            fi
+        fi
+    fi
+
+    # 验证新端口是否在监听
+    sleep 2
+    if command -v ss &>/dev/null; then
+        local listening=$(ss -tlnp 2>/dev/null | grep ":${new_port}" | head -1)
+        if [[ -n "$listening" ]]; then
+            echo -e "${GREEN}[成功] 新 SSH 端口 ${new_port} 已在监听${NC}"
+        else
+            echo -e "${YELLOW}[警告] 未检测到端口 ${new_port} 在监听，请检查 SSH 日志${NC}"
+            echo -e "  journalctl -u sshd -n 20"
+        fi
+    fi
 
     echo -e "${GREEN}[成功] SSH 端口已修改为 ${new_port}${NC}"
     echo -e "${YELLOW}========================================${NC}"
