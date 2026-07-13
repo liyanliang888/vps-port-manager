@@ -384,28 +384,38 @@ change_ssh_port() {
     echo -e "${GREEN}[成功] 已备份原配置到 $BACKUP_DIR/sshd_config_${TIMESTAMP}.bak${NC}"
 
     # 检查主配置文件中是否有 Include sshd_config.d 行
-    # 如果有，确保在 include 目录的文件中也设置端口
     local main_has_include=false
     if [[ -f /etc/ssh/sshd_config ]] && grep -qE "^Include /etc/ssh/sshd_config.d" /etc/ssh/sshd_config 2>/dev/null; then
         main_has_include=true
     fi
 
-    # 检查配置文件中是否已有 Port 行
-    if grep -qE "^#?Port " "$config_file"; then
-        # 替换现有的 Port 行（包括被注释的）
-        sed -i -E "s/^#?Port .*/Port ${new_port}/" "$config_file"
-    else
-        # 添加 Port 行
-        echo "Port ${new_port}" >> "$config_file"
-    fi
-
-    # 如果主配置有 Include 但修改的是主文件，也尝试在 include 目录写入
-    if [[ "$main_has_include" == "true" ]] && [[ "$config_file" == "/etc/ssh/sshd_config" ]]; then
+    if [[ "$main_has_include" == "true" ]]; then
+        # 有 Include 指令：注释掉主文件和所有子配置中的 Port 行，只写 override 文件
+        # 1. 注释掉主配置文件中的 Port 行
+        if grep -qE "^Port " /etc/ssh/sshd_config 2>/dev/null; then
+            sed -i -E "s/^(Port .*)/#\1/" /etc/ssh/sshd_config
+        fi
+        # 2. 注释掉 sshd_config.d 下所有 conf 文件中的 Port 行
+        if [[ -d /etc/ssh/sshd_config.d ]]; then
+            for f in /etc/ssh/sshd_config.d/*.conf; do
+                if [[ -f "$f" ]] && grep -qE "^Port " "$f" 2>/dev/null; then
+                    sed -i -E "s/^(Port .*)/#\1/" "$f"
+                fi
+            done
+        fi
+        # 3. 写入 override 文件（排序靠后，最后被读取，优先级最高）
         mkdir -p /etc/ssh/sshd_config.d 2>/dev/null
-        local override_file="/etc/ssh/sshd_config.d/99-port.conf"
-        echo "Port ${new_port}" > "$override_file"
-        chmod 644 "$override_file"
-        echo -e "${BLUE}[信息] 已写入 ${override_file}（Include 覆盖）${NC}"
+        echo "Port ${new_port}" > /etc/ssh/sshd_config.d/99-port.conf
+        chmod 644 /etc/ssh/sshd_config.d/99-port.conf
+        echo -e "${BLUE}[信息] 已写入 /etc/ssh/sshd_config.d/99-port.conf${NC}"
+        echo -e "${BLUE}[信息] 已注释主配置文件中的旧 Port 行${NC}"
+    else
+        # 没有 Include 指令：直接修改配置文件
+        if grep -qE "^#?Port " "$config_file"; then
+            sed -i -E "s/^#?Port .*/Port ${new_port}/" "$config_file"
+        else
+            echo "Port ${new_port}" >> "$config_file"
+        fi
     fi
 
     # 在防火墙中开放新端口
@@ -436,8 +446,12 @@ change_ssh_port() {
             echo -e "${RED}详情: ${validate_output}${NC}"
             echo -e "${YELLOW}[提示] 正在回滚配置...${NC}"
             cp "$BACKUP_DIR/sshd_config_${TIMESTAMP}.bak" "$config_file"
-            # 清理可能创建的 override 文件
+            # 清理 override 文件
             rm -f /etc/ssh/sshd_config.d/99-port.conf 2>/dev/null || true
+            # 还原主配置中被注释的 Port 行
+            if [[ -f /etc/ssh/sshd_config ]]; then
+                sed -i -E "s/^#(Port .*)/\1/" /etc/ssh/sshd_config 2>/dev/null || true
+            fi
             echo -e "${YELLOW}[提示] 已回滚配置。${NC}"
             return 1
         fi
